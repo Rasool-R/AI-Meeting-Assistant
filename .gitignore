@@ -6,32 +6,53 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
-ENV/
 env/
+ENV/
 
-# Environment variables and secrets (NEVER COMMIT)
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environment variables and secrets (NEVER commit real secrets)
 .env
 .env.*
 !.env.example
 
-# Testing and coverage
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# Local media uploads, temporary processing files, and exports
+storage/
+uploads/
+tmp/
+exports/
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.ogg
+*.webm
+*.flac
+
+# Testing and linting caches
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
-.mypy_cache/
-.ruff_cache/
+coverage.xml
 
 # IDEs and editors
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS-generated files
 .DS_Store
-
-# Local runtime / logs / disposable volumes
-logs/
-*.log
-tmp/
-.opspilot_data/
-
-.history/
+Thumbs.db

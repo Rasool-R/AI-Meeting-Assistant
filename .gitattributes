@@ -1,0 +1,23 @@
+# Auto detect text files and perform LF normalization
+* text=auto eol=lf
+
+# Explicitly declare text files
+*.py text eol=lf diff=python
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.env.example text eol=lf
+*.sql text eol=lf
+
+# Treat media and archives as binary
+*.wav binary
+*.mp3 binary
+*.mp4 binary
+*.m4a binary
+*.ogg binary
+*.webm binary
+*.pdf binary
+*.png binary
+*.jpg binary
