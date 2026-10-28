@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
+    database_url: str = "sqlite:///./meeting_assistant.db"
 
     default_meeting_language: LanguageCode = LanguageCode.MIXED
     supported_languages: Any = [
