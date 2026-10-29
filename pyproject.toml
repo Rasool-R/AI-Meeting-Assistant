@@ -33,7 +33,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
 filterwarnings = [
-    "ignore:.*testclient.*:DeprecationWarning",
+    "ignore::DeprecationWarning",
 ]
 
 [tool.ruff]
