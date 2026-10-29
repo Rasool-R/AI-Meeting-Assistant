@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = "sqlite:///./meeting_assistant.db"
 
+    media_storage_dir: str = "storage/media"
+    max_upload_size_bytes: int = 52_428_800
+
     default_meeting_language: LanguageCode = LanguageCode.MIXED
     supported_languages: Any = [
         LanguageCode.PERSIAN,
