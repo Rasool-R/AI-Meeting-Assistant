@@ -123,10 +123,8 @@ class LocalBilingualTranscriptionProvider:
             max_chunk_duration_seconds=600.0,
         )
 
-        midpoint = round(duration / 2.0, 2)
         end_time = max(round(duration, 2), 2.0)
-        if midpoint >= end_time:
-            midpoint = round(end_time / 2.0, 2)
+        midpoint = round(end_time / 2.0, 2)
 
         if language_hint == LanguageCode.PERSIAN:
             segments = [
