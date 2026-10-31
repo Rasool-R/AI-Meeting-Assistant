@@ -9,6 +9,7 @@ from app.core.config import LanguageCode, Settings, get_settings
 from app.db.session import get_db
 from app.models.media_asset import MediaAsset
 from app.models.meeting import Meeting, MeetingStatus
+from app.models.meeting_minutes import MeetingMinutes
 from app.models.speaker import Speaker
 from app.models.transcript_segment import TranscriptSegment
 from app.schemas.diarization import (
@@ -19,6 +20,16 @@ from app.schemas.diarization import (
 )
 from app.schemas.media import MediaAssetResponse, MeetingStatusResponse
 from app.schemas.meeting import MeetingCreate, MeetingListResponse, MeetingResponse
+from app.schemas.minutes import (
+    ActionItemSchema,
+    AnalyzeMeetingRequest,
+    ContradictionSchema,
+    DecisionSchema,
+    MeetingMinutesResponse,
+    MeetingMinutesUpdateRequest,
+    OpenQuestionSchema,
+    TopicSummarySchema,
+)
 from app.schemas.transcript import (
     MeetingTranscriptResponse,
     TranscribeMeetingRequest,
@@ -32,6 +43,13 @@ from app.services.diarization import (
     get_diarization_provider,
 )
 from app.services.media_storage import store_validated_media_file
+from app.services.meeting_analysis import (
+    MeetingAnalysisError,
+    MeetingAnalysisProvider,
+    SegmentForAnalysis,
+    get_meeting_analysis_provider,
+    run_bounded_meeting_analysis,
+)
 from app.services.transcription import (
     TranscriptionProvider,
     TranscriptionProviderError,
@@ -43,16 +61,22 @@ router = APIRouter(prefix="/meetings", tags=["meetings"])
 DbSession = Annotated[Session, Depends(get_db)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 UploadedMediaFile = Annotated[UploadFile, File(...)]
-SttProvider = Annotated[TranscriptionProvider,
-                        Depends(get_transcription_provider)]
-DiarizerProvider = Annotated[DiarizationProvider,
-                             Depends(get_diarization_provider)]
+SttProvider = Annotated[TranscriptionProvider, Depends(get_transcription_provider)]
+DiarizerProvider = Annotated[DiarizationProvider, Depends(get_diarization_provider)]
+AnalyzerProvider = Annotated[
+    MeetingAnalysisProvider,
+    Depends(get_meeting_analysis_provider),
+]
 TranscribeRequestPayload = Annotated[
     TranscribeMeetingRequest | None,
     Body(),
 ]
 DiarizeRequestPayload = Annotated[
     DiarizeMeetingRequest | None,
+    Body(),
+]
+AnalyzeRequestPayload = Annotated[
+    AnalyzeMeetingRequest | None,
     Body(),
 ]
 
@@ -72,8 +96,7 @@ def build_transcript_response(
     meeting: Meeting,
     segments: list[TranscriptSegment],
 ) -> MeetingTranscriptResponse:
-    segment_models = [TranscriptSegmentResponse.model_validate(
-        seg) for seg in segments]
+    segment_models = [TranscriptSegmentResponse.model_validate(seg) for seg in segments]
     full_text = "\n".join(seg.text for seg in segments)
     return MeetingTranscriptResponse(
         meeting_id=meeting.id,
@@ -81,6 +104,42 @@ def build_transcript_response(
         total_segments=len(segment_models),
         segments=segment_models,
         full_text=full_text,
+    )
+
+
+def build_minutes_response(minutes: MeetingMinutes) -> MeetingMinutesResponse:
+    return MeetingMinutesResponse(
+        id=minutes.id,
+        meeting_id=minutes.meeting_id,
+        output_language=LanguageCode(minutes.output_language),
+        overall_summary=minutes.overall_summary,
+        topic_summaries=[
+            TopicSummarySchema.model_validate(item)
+            for item in minutes.topic_summaries_json
+        ],
+        key_discussion_points=list(minutes.key_discussion_points_json),
+        decisions=[
+            DecisionSchema.model_validate(item) for item in minutes.decisions_json
+        ],
+        action_items=[
+            ActionItemSchema.model_validate(item) for item in minutes.action_items_json
+        ],
+        unresolved_questions=[
+            OpenQuestionSchema.model_validate(item)
+            for item in minutes.unresolved_questions_json
+        ],
+        disagreements_or_contradictions=[
+            ContradictionSchema.model_validate(item)
+            for item in minutes.contradictions_json
+        ],
+        follow_up_items=list(minutes.follow_up_items_json),
+        model_name=minutes.model_name,
+        prompt_version=minutes.prompt_version,
+        repair_attempts_used=minutes.repair_attempts_used,
+        is_user_edited=minutes.is_user_edited,
+        is_approved=minutes.is_approved,
+        created_at=minutes.created_at,
+        updated_at=minutes.updated_at,
     )
 
 
@@ -109,15 +168,12 @@ def rebuild_meeting_speakers(
     for label in sorted(grouped.keys()):
         seg_list = grouped[label]
         total_duration = round(
-            sum(max(0.0, s.end_time_seconds - s.start_time_seconds)
-                for s in seg_list),
+            sum(max(0.0, s.end_time_seconds - s.start_time_seconds) for s in seg_list),
             2,
         )
-        confidences = [
-            s.confidence for s in seg_list if s.confidence is not None]
+        confidences = [s.confidence for s in seg_list if s.confidence is not None]
         avg_conf = (
-            round(sum(confidences) / len(confidences),
-                  4) if confidences else None
+            round(sum(confidences) / len(confidences), 4) if confidences else None
         )
         overlap_count = sum(
             1 for s in seg_list if overlap_by_segment_id.get(s.id, False)
@@ -159,8 +215,7 @@ def create_meeting(
         title=payload.title,
         description=payload.description,
         primary_language=payload.primary_language.value,
-        output_language=(
-            payload.output_language or payload.primary_language).value,
+        output_language=(payload.output_language or payload.primary_language).value,
     )
     db.add(meeting)
     db.commit()
@@ -242,8 +297,7 @@ def get_meeting_status(
         .order_by(MediaAsset.created_at.desc(), MediaAsset.id.desc())
     )
     assets = list(db.scalars(assets_stmt).all())
-    latest_asset = MediaAssetResponse.model_validate(
-        assets[0]) if assets else None
+    latest_asset = MediaAssetResponse.model_validate(assets[0]) if assets else None
 
     return MeetingStatusResponse(
         meeting_id=meeting.id,
@@ -293,16 +347,14 @@ def transcribe_meeting(
 
     if existing_segments and options.force_retranscribe:
         db.execute(
-            delete(TranscriptSegment).where(
-                TranscriptSegment.meeting_id == meeting.id)
+            delete(TranscriptSegment).where(TranscriptSegment.meeting_id == meeting.id)
         )
         db.flush()
 
     meeting.status = MeetingStatus.PROCESSING.value
     db.commit()
 
-    language_hint = options.language_override or LanguageCode(
-        meeting.primary_language)
+    language_hint = options.language_override or LanguageCode(meeting.primary_language)
     try:
         result = provider.transcribe_file(
             file_path=Path(latest_media.storage_path),
@@ -394,8 +446,7 @@ def diarize_meeting(
         )
 
     try:
-        diarization_result = diarizer.diarize_file(
-            Path(latest_media.storage_path))
+        diarization_result = diarizer.diarize_file(Path(latest_media.storage_path))
     except DiarizationProviderError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -449,8 +500,7 @@ def diarize_meeting(
         low_confidence_segments_count=low_confidence_count,
         overlapping_segments_count=overlapping_count,
         speakers=[SpeakerResponse.model_validate(s) for s in speakers],
-        segments=[TranscriptSegmentResponse.model_validate(
-            s) for s in segments],
+        segments=[TranscriptSegmentResponse.model_validate(s) for s in segments],
     )
 
 
@@ -533,3 +583,209 @@ def update_meeting_speaker(
     db.commit()
     db.refresh(speaker)
     return SpeakerResponse.model_validate(speaker)
+
+
+@router.post(
+    "/{meeting_id}/analyze",
+    response_model=MeetingMinutesResponse,
+    status_code=status.HTTP_200_OK,
+)
+def analyze_meeting(
+    meeting_id: str,
+    db: DbSession,
+    analyzer: AnalyzerProvider,
+    payload: AnalyzeRequestPayload = None,
+) -> MeetingMinutesResponse:
+    meeting = get_meeting_or_404(meeting_id, db)
+    options = payload or AnalyzeMeetingRequest()
+
+    target_language = options.output_language or LanguageCode(meeting.output_language)
+
+    existing_stmt = select(MeetingMinutes).where(MeetingMinutes.meeting_id == meeting.id)
+    existing_minutes = db.scalar(existing_stmt)
+    if (
+        existing_minutes is not None
+        and not options.force_reanalyze
+        and existing_minutes.output_language == target_language.value
+    ):
+        return build_minutes_response(existing_minutes)
+
+    segments_stmt = (
+        select(TranscriptSegment)
+        .where(TranscriptSegment.meeting_id == meeting.id)
+        .order_by(TranscriptSegment.segment_index.asc())
+    )
+    segments = list(db.scalars(segments_stmt).all())
+    if not segments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot analyze a meeting before generating transcript segments.",
+        )
+
+    analysis_segments = [
+        SegmentForAnalysis(
+            segment_id=seg.id,
+            segment_index=seg.segment_index,
+            start_time_seconds=seg.start_time_seconds,
+            end_time_seconds=seg.end_time_seconds,
+            speaker_label=seg.speaker_label,
+            text=seg.text,
+            language=seg.language,
+        )
+        for seg in segments
+    ]
+
+    try:
+        result = run_bounded_meeting_analysis(
+            segments=analysis_segments,
+            output_language=target_language,
+            provider=analyzer,
+        )
+    except MeetingAnalysisError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Meeting analysis failed: {exc}",
+        ) from exc
+
+    structured = result.analysis
+    if existing_minutes is None:
+        minutes = MeetingMinutes(
+            meeting_id=meeting.id,
+            output_language=target_language.value,
+            overall_summary=structured.overall_summary,
+            topic_summaries_json=[
+                item.model_dump(mode="json") for item in structured.topic_summaries
+            ],
+            key_discussion_points_json=structured.key_discussion_points,
+            decisions_json=[
+                item.model_dump(mode="json") for item in structured.decisions
+            ],
+            action_items_json=[
+                item.model_dump(mode="json") for item in structured.action_items
+            ],
+            unresolved_questions_json=[
+                item.model_dump(mode="json") for item in structured.unresolved_questions
+            ],
+            contradictions_json=[
+                item.model_dump(mode="json")
+                for item in structured.disagreements_or_contradictions
+            ],
+            follow_up_items_json=structured.follow_up_items,
+            model_name=result.model_name,
+            prompt_version=result.prompt_version,
+            repair_attempts_used=result.repair_attempts_used,
+            is_user_edited=False,
+            is_approved=False,
+        )
+        db.add(minutes)
+    else:
+        minutes = existing_minutes
+        minutes.output_language = target_language.value
+        minutes.overall_summary = structured.overall_summary
+        minutes.topic_summaries_json = [
+            item.model_dump(mode="json") for item in structured.topic_summaries
+        ]
+        minutes.key_discussion_points_json = structured.key_discussion_points
+        minutes.decisions_json = [
+            item.model_dump(mode="json") for item in structured.decisions
+        ]
+        minutes.action_items_json = [
+            item.model_dump(mode="json") for item in structured.action_items
+        ]
+        minutes.unresolved_questions_json = [
+            item.model_dump(mode="json") for item in structured.unresolved_questions
+        ]
+        minutes.contradictions_json = [
+            item.model_dump(mode="json")
+            for item in structured.disagreements_or_contradictions
+        ]
+        minutes.follow_up_items_json = structured.follow_up_items
+        minutes.model_name = result.model_name
+        minutes.prompt_version = result.prompt_version
+        minutes.repair_attempts_used = result.repair_attempts_used
+        minutes.is_user_edited = False
+        minutes.is_approved = False
+
+    meeting.output_language = target_language.value
+    db.commit()
+    db.refresh(minutes)
+    return build_minutes_response(minutes)
+
+
+@router.get("/{meeting_id}/minutes", response_model=MeetingMinutesResponse)
+def get_meeting_minutes(
+    meeting_id: str,
+    db: DbSession,
+) -> MeetingMinutesResponse:
+    meeting = get_meeting_or_404(meeting_id, db)
+    stmt = select(MeetingMinutes).where(MeetingMinutes.meeting_id == meeting.id)
+    minutes = db.scalar(stmt)
+    if minutes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting minutes for '{meeting_id}' have not been generated yet.",
+        )
+    return build_minutes_response(minutes)
+
+
+@router.patch("/{meeting_id}/minutes", response_model=MeetingMinutesResponse)
+def update_meeting_minutes(
+    meeting_id: str,
+    payload: MeetingMinutesUpdateRequest,
+    db: DbSession,
+) -> MeetingMinutesResponse:
+    meeting = get_meeting_or_404(meeting_id, db)
+    stmt = select(MeetingMinutes).where(MeetingMinutes.meeting_id == meeting.id)
+    minutes = db.scalar(stmt)
+    if minutes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting minutes for '{meeting_id}' have not been generated yet.",
+        )
+
+    content_modified = False
+    if payload.overall_summary is not None:
+        minutes.overall_summary = payload.overall_summary
+        content_modified = True
+    if payload.topic_summaries is not None:
+        minutes.topic_summaries_json = [
+            item.model_dump(mode="json") for item in payload.topic_summaries
+        ]
+        content_modified = True
+    if payload.key_discussion_points is not None:
+        minutes.key_discussion_points_json = payload.key_discussion_points
+        content_modified = True
+    if payload.decisions is not None:
+        minutes.decisions_json = [
+            item.model_dump(mode="json") for item in payload.decisions
+        ]
+        content_modified = True
+    if payload.action_items is not None:
+        minutes.action_items_json = [
+            item.model_dump(mode="json") for item in payload.action_items
+        ]
+        content_modified = True
+    if payload.unresolved_questions is not None:
+        minutes.unresolved_questions_json = [
+            item.model_dump(mode="json") for item in payload.unresolved_questions
+        ]
+        content_modified = True
+    if payload.disagreements_or_contradictions is not None:
+        minutes.contradictions_json = [
+            item.model_dump(mode="json")
+            for item in payload.disagreements_or_contradictions
+        ]
+        content_modified = True
+    if payload.follow_up_items is not None:
+        minutes.follow_up_items_json = payload.follow_up_items
+        content_modified = True
+
+    if content_modified:
+        minutes.is_user_edited = True
+
+    if payload.is_approved is not None:
+        minutes.is_approved = payload.is_approved
+
+    db.commit()
+    db.refresh(minutes)
+    return build_minutes_response(minutes)
